@@ -1,0 +1,323 @@
+// ============================================================
+// 2D Wire Arc Additive Manufacturing (WAAM) - FreeFEM++
+// Moving arc deposits material layer by layer on substrate
+// Goldak double-ellipsoid volumetric heat source
+// Element activation: quiet element method
+// Output: VTU + PVD for ParaView animation
+// ============================================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\waam_results\\";
+system("mkdir \"D:\\freefem++\\waam_results\"");
+
+// ============================================================
+// GEOMETRY
+// ============================================================
+real Lx      = 80e-3;
+real Hsub    = 10e-3;
+real Hlayer  = 2e-3;
+int  Nl      = 4;
+real Htot    = Hsub + Nl * Hlayer;
+
+int BotEdge   = 1;
+int RightEdge = 2;
+int TopEdge   = 3;
+int LeftEdge  = 4;
+
+border E1(t=0.,  Lx)   { x=t;    y=0.;     label=BotEdge;   }
+border E2(t=0.,  Htot) { x=Lx;   y=t;      label=RightEdge; }
+border E3(t=0.,  Lx)   { x=Lx-t; y=Htot;   label=TopEdge;   }
+border E4(t=0.,  Htot) { x=0.;   y=Htot-t; label=LeftEdge;  }
+
+mesh Th = buildmesh(E1(120) + E2(30) + E3(120) + E4(30));
+
+func rfineW = Hlayer / (1. + 10.*abs(y - Hsub) / Hlayer);
+Th = adaptmesh(Th, rfineW, IsMetric=1, nbvx=150000,
+               hmax=Lx/60., hmin=Hlayer/8.);
+
+// ============================================================
+// MATERIAL PROPERTIES (low-carbon steel ER70S)
+// ============================================================
+real rhoM  = 7800.;
+real cpM   = 600.;
+real kkM   = 35.;
+real TmM   = 1773.;
+real T0    = 300.;
+real hc    = 15.;
+
+// Quiet element (inactive layer) properties
+real rhoQ  = rhoM * 1e-3;
+real cpQ   = cpM;
+real kkQ   = kkM * 1e-4;
+
+// ============================================================
+// ARC PARAMETERS (Goldak double-ellipsoid)
+// ============================================================
+real Varc   = 20.;
+real Iarc   = 180.;
+real etaArc = 0.85;
+real Qarc   = etaArc * Varc * Iarc;
+
+real af  = 4e-3;
+real ar  = 8e-3;
+real cc  = 3e-3;
+real ff  = 0.6;
+real fr  = 1.4;
+
+real afsq = af * af;
+real arsq = ar * ar;
+real ccsq = cc * cc;
+
+real Qf = 6.*sqrt(3.)*ff*Qarc / (pi*sqrt(pi)*af*af*cc);
+real Qr = 6.*sqrt(3.)*fr*Qarc / (pi*sqrt(pi)*ar*ar*cc);
+
+// ============================================================
+// SCAN PARAMETERS
+// ============================================================
+real varc       = 8e-3;
+real tscan      = Lx / varc;
+real dt         = 5e-3;
+int  ntPerLayer = int(tscan / dt);
+int  ntTotal    = Nl * ntPerLayer;
+
+// ============================================================
+// FE SPACES
+// ============================================================
+fespace Ph(Th, P0);
+fespace Vh(Th, P1);
+
+Ph rhoField, cpField, kkField;
+Ph layerID;
+Ph activeField;
+
+Vh T, Told, v;
+Vh meltpool, meltever, meltdepth;
+Vh materialViz;
+
+// ============================================================
+// ASSIGN LAYER ID AND INITIAL MATERIAL STATE
+// ============================================================
+for (int k = 0; k < Th.nt; k++) {
+    real ye = (Th[k][0].y + Th[k][1].y + Th[k][2].y) / 3.;
+
+    int lid = 0;
+    if (ye > Hsub) {
+        lid = int((ye - Hsub) / Hlayer) + 1;
+        if (lid > Nl) lid = Nl;
+    }
+    layerID[][k] = lid;
+
+    if (lid == 0) {
+        activeField[][k] = 1.;
+        rhoField[][k]    = rhoM;
+        cpField[][k]     = cpM;
+        kkField[][k]     = kkM;
+        materialViz[][k] = 1.;
+    } else {
+        activeField[][k] = 0.;
+        rhoField[][k]    = rhoQ;
+        cpField[][k]     = cpQ;
+        kkField[][k]     = kkQ;
+        materialViz[][k] = 0.;
+    }
+}
+
+// ============================================================
+// INITIALIZE TEMPERATURE
+// ============================================================
+T        = T0;
+Told     = T0;
+meltpool = 0.;
+meltever = 0.;
+
+// ============================================================
+// ARC CENTER (global, updated each step)
+// ============================================================
+real xc = 0.;
+real yc = Hsub + 0.5*Hlayer;
+
+// ============================================================
+// PVD HEADER
+// ============================================================
+{
+ofstream pvd(outdir + "waam.pvd");
+pvd << "<?xml version=\"1.0\"?>" << endl;
+pvd << "<VTKFile type=\"Collection\" version=\"0.1\">" << endl;
+pvd << "<Collection>" << endl;
+}
+
+cout << "==========================================" << endl;
+cout << " Wire Arc Additive Manufacturing (WAAM)"   << endl;
+cout << " Lx      = " << Lx*1e3     << " mm"        << endl;
+cout << " Hsub    = " << Hsub*1e3   << " mm"        << endl;
+cout << " Nl      = " << Nl         << " layers"    << endl;
+cout << " Hlayer  = " << Hlayer*1e3 << " mm"        << endl;
+cout << " Qarc    = " << Qarc       << " W"         << endl;
+cout << " varc    = " << varc*1e3   << " mm/s"      << endl;
+cout << " dt      = " << dt         << " s"         << endl;
+cout << " Steps/layer = " << ntPerLayer             << endl;
+cout << " Total steps = " << ntTotal                << endl;
+cout << "==========================================" << endl;
+
+// ============================================================
+// LAYER LOOP
+// ============================================================
+int saveCount = 0;
+
+for (int layer = 1; layer <= Nl; layer++) {
+
+    // ---- Activate current layer elements ----
+    cout << "--- Activating layer " << layer << " ---" << endl;
+
+    for (int k = 0; k < Th.nt; k++) {
+        if (int(layerID[][k]) == layer) {
+            activeField[][k] = 1.;
+            rhoField[][k]    = rhoM;
+            cpField[][k]     = cpM;
+            kkField[][k]     = kkM;
+            materialViz[][k] = layer + 1.;
+        }
+    }
+
+    // ---- Reset newly activated layer nodes to T0 ----
+    real yLayerBot = Hsub + (layer - 1) * Hlayer;
+    real yLayerTop = Hsub +  layer      * Hlayer;
+
+    for (int j = 0; j < Th.nv; j++) {
+        if (Th(j).y > yLayerBot && Th(j).y <= yLayerTop) {
+            T[][j]    = T0;
+            Told[][j] = T0;
+        }
+    }
+
+    // ---- Rebuild matrix with newly activated layer ----
+    varf aLHS(T, v) =
+          int2d(Th)( (rhoField*cpField/dt) * T * v )
+        + int2d(Th)( kkField * (dx(T)*dx(v) + dy(T)*dy(v)) )
+        + int1d(Th, BotEdge)(   hc * T * v )
+        + int1d(Th, RightEdge)( hc * T * v )
+        + int1d(Th, TopEdge)(   hc * T * v )
+        + int1d(Th, LeftEdge)(  hc * T * v )
+        ;
+
+    matrix A = aLHS(Vh, Vh);
+    set(A, solver=CG);
+
+    // ---- Arc direction: odd layers L->R, even layers R->L ----
+    real xarcStart, xarcEnd, xarcDir;
+    if (layer % 2 == 1) {
+        xarcStart = 0.;
+        xarcEnd   = Lx;
+        xarcDir   = 1.;
+    } else {
+        xarcStart = Lx;
+        xarcEnd   = 0.;
+        xarcDir   = -1.;
+    }
+
+    // Arc y-center = midplane of current layer
+    yc = Hsub + (layer - 0.5) * Hlayer;
+    xc = xarcStart;
+
+    // ---- Timestep loop for this layer ----
+    for (int i = 1; i <= ntPerLayer; i++) {
+        real t = ((layer-1)*ntPerLayer + i) * dt;
+
+        // Update arc position
+        xc = xarcStart + xarcDir * varc * (i * dt);
+        if (xarcDir > 0. && xc > xarcEnd) xc = xarcEnd;
+        if (xarcDir < 0. && xc < xarcEnd) xc = xarcEnd;
+
+        // ---- Build RHS with Goldak volumetric source ----
+        varf aRHS(unused, v) =
+              int2d(Th)( (rhoField*cpField/dt) * Told * v )
+            + int1d(Th, BotEdge)(   hc * T0 * v )
+            + int1d(Th, RightEdge)( hc * T0 * v )
+            + int1d(Th, TopEdge)(   hc * T0 * v )
+            + int1d(Th, LeftEdge)(  hc * T0 * v )
+            // Goldak front ellipsoid (x >= xc)
+            + int2d(Th)(
+                activeField
+                * (x >= xc) * Qf
+                * exp(-3.*(x-xc)*(x-xc)/afsq)
+                * exp(-3.*(y-yc)*(y-yc)/ccsq)
+                * v
+              )
+            // Goldak rear ellipsoid (x < xc)
+            + int2d(Th)(
+                activeField
+                * (x < xc) * Qr
+                * exp(-3.*(x-xc)*(x-xc)/arsq)
+                * exp(-3.*(y-yc)*(y-yc)/ccsq)
+                * v
+              )
+            ;
+
+        real[int] b = aRHS(0, Vh);
+        T[] = A^-1 * b;
+
+        // ---- Clamp at melting point ----
+        for (int j = 0; j < T[].n; j++)
+            if (T[][j] > TmM) T[][j] = TmM;
+
+        // ---- Melt pool tracking ----
+        for (int j = 0; j < T[].n; j++) {
+            if (T[][j] >= TmM - 1.) {
+                meltpool[][j] = 1.;
+                meltever[][j] = 1.;
+            } else {
+                meltpool[][j] = 0.;
+            }
+        }
+
+        meltdepth = T - TmM;
+        Told      = T;
+
+        // ---- Save every 5 steps ----
+        if (i % 5 == 0) {
+            saveCount++;
+            string num;
+            if      (saveCount < 10)   num = "000" + saveCount;
+            else if (saveCount < 100)  num = "00"  + saveCount;
+            else if (saveCount < 1000) num = "0"   + saveCount;
+            else                       num = ""    + saveCount;
+
+            int[int] ord = [1, 1, 1, 1, 1];
+            savevtk(outdir + "result_" + num + ".vtu", Th,
+                    T, meltpool, meltever, meltdepth, materialViz,
+                    dataname = "Temperature MeltPool MeltEver MeltDepth Material",
+                    order = ord);
+
+            {
+            ofstream pvd(outdir + "waam.pvd", append);
+            pvd << "  <DataSet timestep=\"" << t
+                << "\" file=\"result_" << num << ".vtu\"/>" << endl;
+            }
+
+            int nmelt = 0;
+            for (int j = 0; j < T[].n; j++)
+                if (meltpool[][j] > 0.5) nmelt++;
+
+            cout << "Layer " << layer << "/" << Nl
+                 << "  Step "  << i          << "/" << ntPerLayer
+                 << "  t="     << t          << " s"
+                 << "  xarc="  << xc*1e3     << " mm"
+                 << "  Tmax="  << T[].max    << " K"
+                 << "  Melt="  << nmelt      << " nodes" << endl;
+        }
+    }
+
+    cout << "--- Layer " << layer << " complete ---" << endl;
+}
+
+// ============================================================
+// CLOSE PVD
+// ============================================================
+{
+ofstream pvd(outdir + "waam.pvd", append);
+pvd << "</Collection>" << endl;
+pvd << "</VTKFile>"    << endl;
+}
+
+cout << "Done. Open waam.pvd in ParaView." << endl;
